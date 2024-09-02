@@ -4,7 +4,7 @@ The original paper, Attention Is All You Need, is available on (https://arxiv.or
 
 The comments could be stated in one line will be annoted with #, the comments using more than one line is annoted between \" or \""". To distinguish original comments and ones I wrote on my own, the comments I added did not use capital letter at the beginning of the comments.
 
-The file transformer.py focused on the transformers structure. I will soon update the Complete_Model.py, which describes how we sett up and train the whole model described in the blog, by the end of week 2, September.
+The file transformer.py focused on the transformers structure. I will soon update the Complete_Model.py, which describes how we sett up and train the whole model described in the blog, by the end of week 4, September.
 
 Please put both files in the same folder if you want to run the Complete_Model.py.
 
