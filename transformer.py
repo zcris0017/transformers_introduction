@@ -1,20 +1,78 @@
 #%%
-import numpy as np
+import torchtext; torchtext.disable_torchtext_deprecation_warning()
+import os
+from os.path import exists
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math, copy, time
-from torch.autograd import Variable
-import matplotlib.pyplot as plt
-import seaborn
-seaborn.set_context(context="talk")
-# matplotlib inline
+from torch.nn.functional import log_softmax, pad
+import math
+import copy
+import time
+from torch.optim.lr_scheduler import LambdaLR
+import pandas as pd
+import altair as alt
+from torchtext.data.functional import to_map_style_dataset
+from torch.utils.data import DataLoader
+from torchtext.vocab import build_vocab_from_iterator
+import torchtext.datasets as datasets
 
-#%%
+import spacy
+import GPUtil
+import warnings
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+# Set to False to skip notebook execution (e.g. for debugging)
+warnings.filterwarnings("ignore")
+RUN_EXAMPLES = True
+
+
+################################################################################
+# Some convenience helper functions used throughout the notebook
+
+
+def is_interactive_notebook():
+    return __name__ == "__main__"
+
+
+def show_example(fn, args=[]):
+    if __name__ == "__main__" and RUN_EXAMPLES:
+        return fn(*args)
+
+
+def execute_example(fn, args=[]):
+    if __name__ == "__main__" and RUN_EXAMPLES:
+        fn(*args)
+
+
+class DummyOptimizer(torch.optim.Optimizer):
+    def __init__(self):
+        self.param_groups = [{"lr": 0}]
+        None
+
+    def step(self):
+        None
+
+    def zero_grad(self, set_to_none=False):
+        None
+
+
+class DummyScheduler:
+    def step(self):
+        None
+
+
+################################################################################
 class EncoderDecoder(nn.Module):
     """
     A standard Encoder-Decoder architecture. Base for this and many 
     other models.
+    the encoder maps an input sequence of symbol representations 
+    (x_1, ..., x_n) to a sequence of continuous representations, z=
+    (z_1, ..., z_n).
     Encoder-Decoder architecture changes input sequences into vectors,
     vice-versa.
     """
@@ -45,9 +103,9 @@ class Generator(nn.Module):
     """Define standard linear + softmax generation step."""
     def __init__(self, d_model, vocab):
         """
-        Linear transformation, x * W^T + b, W as weight and b as bias, d_model is the size 
-        of the input tensor, vocab is the size of the output tensor. For an input tensor like 
-        (batch_size, seq_length, input_size), tensor[-1] would be d_model
+        linear transformation, x * W^T + b, W as weight and b as bias, d_model is the size 
+        of the input tensor, vocab is the size of the output tensor. for an input tensor like 
+        (batch_size, seq_length, input_size), tensor[-1] would be d_model.
         """
         super(Generator, self).__init__() 
         #make initialisation global
@@ -58,17 +116,17 @@ class Generator(nn.Module):
         Here we take the log of the partition function, log(exp(x_i) / sum(exp(x_j) for j in
         range(len(x). This avoids data overflow.
         """
-        return F.log_softmax(self.proj(x), dim=-1)
+        return log_softmax(self.proj(x), dim=-1)
     
 
-#%%
+################################################################################
 def clones(module, N):
     """Produce N identical layers."""
-    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)]) 
+    return nn.ModuleList([copy.deepcopy(module) for i in range(N)]) 
     # create N copies of module as a ModuleList
 
 class Encoder(nn.Module):
-    """A complete Encoder incudes N layers"""
+    """Core encoder is a stack of N layers"""
     def __init__(self, layer, N):
         super(Encoder, self).__init__()
         self.layers = clones(layer, N) 
@@ -77,7 +135,7 @@ class Encoder(nn.Module):
         # normalise every single layer
         
     def forward(self, x, mask):
-        """Create layers with x and mask"""
+        """Pass the input (and mask) through each layer in turn."""
         for layer in self.layers:
             x = layer(x, mask) 
             # define layers
@@ -85,7 +143,7 @@ class Encoder(nn.Module):
         # normalise
     
 
-# %%
+################################################################################
 class LayerNorm(nn.Module):
     """
     Construct a layernorm module (See arXiv:1607.06450). The goal is to calculate mean and 
@@ -110,7 +168,7 @@ class LayerNorm(nn.Module):
         # first term and last term made Affine Transformation, the term in the middle is normalisation term.
     
 
-#%%
+################################################################################
 class SublayerConnection(nn.Module):
     """
     A residual connection followed by a layer norm.
@@ -123,11 +181,13 @@ class SublayerConnection(nn.Module):
         # randomly drop some layers to avoid producing same results, fraction == dropout
 
     def forward(self, x, sublayer):
-        """Apply residual connection to any sublayer with the same size."""
+        """
+        Apply residual connection to any sublayer with the same size.
+        """
         return x + self.dropout(sublayer(self.norm(x)))
     
 
-#%%    
+################################################################################    
 class EncoderLayer(nn.Module):
     """
     Encoder is made up of self-attn and feed forward (defined below)
@@ -141,14 +201,13 @@ class EncoderLayer(nn.Module):
         self.size = size
 
     def forward(self, x, mask):
-        """Follow Figure 1 (left) for connections."""
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask)) 
         """x is used to control the input tensor with Causal Self Attention with mask,
         x in self_attn(x, x, x, mask) means query, key and value."""
         return self.sublayer[1](x, self.feed_forward) 
     
 
-#%%
+################################################################################
 class Decoder(nn.Module):
     """
     Generic N layer decoder with masking.
@@ -167,10 +226,10 @@ class Decoder(nn.Module):
         return self.norm(x)
     
 
-#%%
+################################################################################
 class DecoderLayer(nn.Module):
     """
-    Decoder is made of self-attn, src-attn, and feed forward (defined below)
+    Decoder is made of self-attn, src-attn, and feed forward (defined below).
     """
     def __init__(self, size, self_attn, src_attn, feed_forward, dropout):
         super(DecoderLayer, self).__init__()
@@ -181,7 +240,9 @@ class DecoderLayer(nn.Module):
         self.sublayer = clones(SublayerConnection(size, dropout), 3)
  
     def forward(self, x, memory, src_mask, tgt_mask):
-        "Forward the combined layer from source and target with mask. "
+        """
+        Forward the combined layer from source and target with mask. 
+        """
         m = memory
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask)) 
         # mark masked sublayer as x
@@ -190,18 +251,57 @@ class DecoderLayer(nn.Module):
         return self.sublayer[2](x, self.feed_forward)
         
 
-#%%
+################################################################################
 def subsequent_mask(size):
-    "Mask out subsequent positions. "
-    attn_shape = (1, size, size) 
+    "Mask out subsequent positions."
+    attn_shape = (1, size, size)
     # size of the mask, with size of (batch_size, sequence_length, sequence_length)
-    subsequent_mask = np.triu(np.ones(attn_shape), k=1).astype('uint8')
+    subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(
+        torch.uint8
+    )
     # set a matrix with 1 on the triangle below the diagonal and 0 on the upper triangle.
-    return torch.from_numpy(subsequent_mask) == 0
+    return subsequent_mask == 0
     # change the matrix into tensor and shield the element if the element == 0.
 
 
-#%%
+################################################################################
+"""
+Below the attention mask shows the position each tgt word (row) is allowed to look at (column). Words are 
+blocked for attending to future words during training.
+"""
+def example_mask():
+    LS_data = pd.concat(# combining dataframes into one
+        [
+            pd.DataFrame(
+                {
+                    "Subsequent Mask": subsequent_mask(20)[0][x, y].flatten(),
+                    # flatten enables further processing like calculating loss of data
+                    "Window": y,
+                    "Masking": x,
+                }
+            )
+            for y in range(20)
+            for x in range(20)
+        ]
+    )
+    #making a dataframe of size 20*20
+    return (
+        alt.Chart(LS_data)
+        .mark_rect()
+        .properties(height=250, width=250)
+        .encode(
+            alt.X("Window:O"),
+            alt.Y("Masking:O"),
+            alt.Color("Subsequent Mask:Q", scale=alt.Scale(scheme="viridis")),
+        )
+        .interactive()
+    )
+
+
+show_example(example_mask)
+
+
+################################################################################
 def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1) 
@@ -212,7 +312,7 @@ def attention(query, key, value, mask=None, dropout=None):
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
     # for the same reason, replace mask with very small number to avoid uneffective softmax functions
-    p_attn = F.softmax(scores, dim = -1) 
+    p_attn = scores.softmax(scores, dim = -1) 
     # apply softmax function along the last dimension
     if dropout is not None:
         p_attn = dropout(p_attn) 
@@ -221,7 +321,7 @@ def attention(query, key, value, mask=None, dropout=None):
     # return the product of weight and tensor, which is the attension output, and the weight
 
 
-#%%
+################################################################################
 class MultiHeadedAttention(nn.Module):
     def __init__(self, h, d_model, dropout=0.1):
         "Take in model size and number of heads."
@@ -268,10 +368,13 @@ class MultiHeadedAttention(nn.Module):
         """
         x = x.transpose(1, 2).contiguous() \
              .view(nbatches, -1, self.h * self.d_k)
+        del query
+        del key
+        del value # release the memory
         return self.linears[-1](x) # send x to the last layer
     
 
-#%%
+################################################################################
 class PositionwiseFeedForward(nn.Module):
     """Implements FFN equation."""
     def __init__(self, d_model, d_ff, dropout=0.1):
@@ -287,10 +390,10 @@ class PositionwiseFeedForward(nn.Module):
         F.relu() applies activation function to the linear layer w_1(x);
         the final result for w_1 is transferred to w_2
         """
-        return self.w_2(self.dropout(F.relu(self.w_1(x))))
+        return self.w_2(self.dropout(self.w_1(x).relu()))
     
 
-#%%
+################################################################################
 class Embeddings(nn.Module):
     """project discrete inputs into continuous vectors"""
     def __init__(self, d_model, vocab):
@@ -307,7 +410,7 @@ class Embeddings(nn.Module):
         return self.lut(x) * math.sqrt(self.d_model)
     
 
-#%%
+################################################################################
 class PositionalEncoding(nn.Module):
     "Implement the PE function."
     def __init__(self, d_model, dropout, max_len=5000):
@@ -349,8 +452,35 @@ class PositionalEncoding(nn.Module):
         Variable( , requires_grad=False) cancels gradient calculation for position encoding,
         prevents reversed propagation.
         """
-        x = x + Variable(self.pe[:, :x.size(1)], 
-                         requires_grad=False)
+        x = x + self.pe[:, :x.size(1)].requires_grad_(False)
         return self.dropout(x)
     
 
+################################################################################
+def example_positional():
+    pe = PositionalEncoding(20, 0)
+    y = pe.forward(torch.zeros(1, 100, 20)) # positional encoding tensor (torch.zeros(1, 100, 20))
+
+    data = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "embedding": y[0, :, dim],
+                    "dimension": dim,
+                    "position": list(range(100)),
+                }
+            )
+            for dim in [4, 5, 6, 7] # create dataframe for each dimension
+        ]
+    )
+
+    return (
+        alt.Chart(data)
+        .mark_line()
+        .properties(width=800)
+        .encode(x="position", y="embedding", color="dimension:N")
+        .interactive()
+    )
+
+show_example(example_positional)
+# %%
