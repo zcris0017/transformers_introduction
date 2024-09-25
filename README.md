@@ -9,3 +9,5 @@ The file transformer.py focused on the transformers structure. I will soon updat
 Please put both files in the same folder if you want to run the Complete_Model.py.
 
 Please feel free to email me at zcr1281474170@163.com if there is anything wrong with the explanation to the codes.
+
+More details about BPE, Search, Averaging can be found on https://github.com/opennmt/opennmt-py
