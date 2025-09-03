@@ -6,8 +6,6 @@ exec(code)
 import function failed on my system so transformer.py was run as part of this file here.
 """
 
-
-#%%
 ################################################################################
 """
 Full Model
@@ -654,3 +652,4 @@ def example_simple_model():
 
 
 execute_example(example_simple_model)
+# %%

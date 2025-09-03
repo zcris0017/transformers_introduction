@@ -1,29 +1,32 @@
-#%%
-import torchtext; torchtext.disable_torchtext_deprecation_warning()
 import os
 from os.path import exists
 import torch
 import torch.nn as nn
-from torch.nn.functional import log_softmax, pad
+from torch.nn import functional as F
 import math
 import copy
 import time
 from torch.optim.lr_scheduler import LambdaLR
 import pandas as pd
 import altair as alt
-from torchtext.data.functional import to_map_style_dataset
 from torch.utils.data import DataLoader
-from torchtext.vocab import build_vocab_from_iterator
-import torchtext.datasets as datasets
 
-import spacy
-import GPUtil
 import warnings
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Optional imports - only import if available
+try:
+    import spacy
+except ImportError:
+    spacy = None
+
+try:
+    import GPUtil
+except ImportError:
+    GPUtil = None
 
 # Set to False to skip notebook execution (e.g. for debugging)
 warnings.filterwarnings("ignore")
@@ -116,7 +119,7 @@ class Generator(nn.Module):
         Here we take the log of the partition function, log(exp(x_i) / sum(exp(x_j) for j in
         range(len(x). This avoids data overflow.
         """
-        return log_softmax(self.proj(x), dim=-1)
+        return F.log_softmax(self.proj(x), dim=-1)
     
 
 ################################################################################
@@ -256,9 +259,7 @@ def subsequent_mask(size):
     "Mask out subsequent positions."
     attn_shape = (1, size, size)
     # size of the mask, with size of (batch_size, sequence_length, sequence_length)
-    subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(
-        torch.uint8
-    )
+    subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1).type(torch.bool)
     # set a matrix with 1 on the triangle below the diagonal and 0 on the upper triangle.
     return subsequent_mask == 0
     # change the matrix into tensor and shield the element if the element == 0.
@@ -306,13 +307,12 @@ def attention(query, key, value, mask=None, dropout=None):
     "Compute 'Scaled Dot Product Attention'"
     d_k = query.size(-1) 
     # query usually equals to (batch_size, sequence_length, embedding_dim), here returns embedding_dim
-    scores = torch.matmul(query, key.transpose(-2, -1)) \
-             / math.sqrt(d_k)
+    scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
     # dot product of query and key, devided by math.sqrt(d_k) to avoid overflow that fails softmax function
     if mask is not None:
         scores = scores.masked_fill(mask == 0, -1e9)
     # for the same reason, replace mask with very small number to avoid uneffective softmax functions
-    p_attn = scores.softmax(scores, dim = -1) 
+    p_attn = F.softmax(scores, dim=-1) 
     # apply softmax function along the last dimension
     if dropout is not None:
         p_attn = dropout(p_attn) 
@@ -390,7 +390,7 @@ class PositionwiseFeedForward(nn.Module):
         F.relu() applies activation function to the linear layer w_1(x);
         the final result for w_1 is transferred to w_2
         """
-        return self.w_2(self.dropout(self.w_1(x).relu()))
+        return self.w_2(self.dropout(F.relu(self.w_1(x))))
     
 
 ################################################################################
@@ -483,4 +483,37 @@ def example_positional():
     )
 
 show_example(example_positional)
-# %%
+
+
+################################################################################
+# Model construction helper function
+def make_model(src_vocab, tgt_vocab, N=6, 
+               d_model=512, d_ff=2048, h=8, dropout=0.1):
+    """Helper: Construct a model from hyperparameters."""
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), 
+                           c(ff), dropout), N),
+        nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
+        nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
+        Generator(d_model, tgt_vocab))
+    
+    # This was important from their code. 
+    # Initialize parameters with Glorot / fan_avg.
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform_(p)
+    return model
+
+
+################################################################################
+# Example usage
+if __name__ == "__main__":
+    # Create a small model for testing
+    tmp_model = make_model(10, 10, 2)
+    print("Model created successfully!")
+    print(f"Number of parameters: {sum(p.numel() for p in tmp_model.parameters())}")

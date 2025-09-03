@@ -5,4 +5,3 @@ GPUtil==1.4.0
 pandas==2.3.2
 spacy==3.8.7
 torch==2.8.0
-torchtext==0.18.0
